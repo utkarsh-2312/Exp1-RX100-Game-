@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>RX100 Dodge — Retro Lane Racer</title>
+<meta name="description" content="A retro, RX100-inspired lane-dodging bike game built with plain HTML, CSS and JavaScript." />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+  <div id="app">
+
+    <!-- Heads-up display: score / best / speed -->
+    <header id="hud">
+      <div class="hud-item">
+        <span class="hud-label">Score</span>
+        <span class="hud-value" id="scoreValue">0</span>
+      </div>
+      <div class="hud-item">
+        <span class="hud-label">Best</span>
+        <span class="hud-value" id="bestValue">0</span>
+      </div>
+      <div class="hud-item">
+        <span class="hud-label">Speed</span>
+        <span class="hud-value" id="speedValue">0</span>
+      </div>
+    </header>
+
+    <!-- Game stage: canvas + overlays live in the same box so they align perfectly -->
+    <div id="stage">
+      <canvas id="gameCanvas"></canvas>
+
+      <!-- Start screen -->
+      <div id="startScreen" class="overlay">
+        <div class="overlay-panel">
+          <h1 class="title">RX100 <span class="title-accent">DODGE</span></h1>
+          <p class="subtitle">A retro two-stroke soul on a three-lane highway.</p>
+
+          <ul class="instructions">
+            <li><span class="key">&larr;</span><span class="key">&rarr;</span> or <span class="key">A</span><span class="key">D</span> — change lanes</li>
+            <li><span class="key">Space</span> / <span class="key">Enter</span> — start &amp; restart</li>
+            <li class="touch-hint">On touch devices, use the on-screen arrows</li>
+          </ul>
+
+          <button id="startButton" class="btn-primary">Start Ride</button>
+        </div>
+      </div>
+
+      <!-- Game over screen -->
+      <div id="gameOverScreen" class="overlay hidden">
+        <div class="overlay-panel">
+          <h1 class="title crash-title">CRASHED!</h1>
+          <p class="subtitle">The road wins this one.</p>
+
+          <div class="final-stats">
+            <div>
+              <span class="hud-label">Score</span>
+              <span class="hud-value" id="finalScore">0</span>
+            </div>
+            <div>
+              <span class="hud-label">Best</span>
+              <span class="hud-value" id="finalBest">0</span>
+            </div>
+          </div>
+
+          <button id="restartButton" class="btn-primary">Ride Again</button>
+          <p class="restart-hint">or press Space / Enter</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- Touch controls for mobile -->
+    <div id="touchControls">
+      <button id="btnLeft" class="touch-btn" aria-label="Move left">&#9664;</button>
+      <button id="btnRight" class="touch-btn" aria-label="Move right">&#9654;</button>
+    </div>
+
+  </div>
+
+  <script src="game.js"></script>
+</body>
+</html>
