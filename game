@@ -1,0 +1,692 @@
+/* ==========================================================================
+   RX100 Dodge — game.js
+   A tiny, dependency-free lane-dodging game rendered on HTML5 Canvas.
+
+   Everything lives in one file on purpose: it's meant to be easy to read
+   top-to-bottom for a beginner. Sections are marked with big comment
+   banners so you can jump straight to the part you care about.
+   ========================================================================== */
+
+(() => {
+  'use strict';
+
+  /* ------------------------------------------------------------------ *
+   *  DOM references
+   * ------------------------------------------------------------------ */
+
+  const canvas = document.getElementById('gameCanvas');
+  const ctx = canvas.getContext('2d');
+
+  const startScreen = document.getElementById('startScreen');
+  const gameOverScreen = document.getElementById('gameOverScreen');
+  const startButton = document.getElementById('startButton');
+  const restartButton = document.getElementById('restartButton');
+
+  const scoreValueEl = document.getElementById('scoreValue');
+  const bestValueEl = document.getElementById('bestValue');
+  const speedValueEl = document.getElementById('speedValue');
+  const finalScoreEl = document.getElementById('finalScore');
+  const finalBestEl = document.getElementById('finalBest');
+
+  const btnLeft = document.getElementById('btnLeft');
+  const btnRight = document.getElementById('btnRight');
+
+  /* ------------------------------------------------------------------ *
+   *  Canvas setup
+   *
+   *  We render to a fixed internal resolution and let CSS scale the
+   *  canvas element to fit the screen. That keeps all the game math
+   *  simple (no need to recompute lane positions on every resize) while
+   *  still looking crisp and responsive on any device.
+   * ------------------------------------------------------------------ */
+
+  const WIDTH = 400;
+  const HEIGHT = 700;
+  canvas.width = WIDTH;
+  canvas.height = HEIGHT;
+
+  /* ------------------------------------------------------------------ *
+   *  Road / lane geometry
+   * ------------------------------------------------------------------ */
+
+  const LANE_COUNT = 3;
+  const ROAD_LEFT = WIDTH * 0.14;
+  const ROAD_RIGHT = WIDTH * 0.86;
+  const ROAD_WIDTH = ROAD_RIGHT - ROAD_LEFT;
+  const LANE_WIDTH = ROAD_WIDTH / LANE_COUNT;
+
+  // Precompute the horizontal center of each lane.
+  const laneCenters = [];
+  for (let i = 0; i < LANE_COUNT; i++) {
+    laneCenters.push(ROAD_LEFT + LANE_WIDTH * (i + 0.5));
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  High score persistence
+   * ------------------------------------------------------------------ */
+
+  const HIGH_SCORE_KEY = 'rx100Dodge.highScore';
+
+  function loadHighScore() {
+    const raw = localStorage.getItem(HIGH_SCORE_KEY);
+    const value = raw ? parseInt(raw, 10) : 0;
+    return Number.isFinite(value) ? value : 0;
+  }
+
+  function saveHighScore(value) {
+    try {
+      localStorage.setItem(HIGH_SCORE_KEY, String(value));
+    } catch (err) {
+      // localStorage can fail in private-browsing modes — that's fine,
+      // the game just won't remember the best score between sessions.
+    }
+  }
+
+  let highScore = loadHighScore();
+
+  /* ------------------------------------------------------------------ *
+   *  Game state
+   * ------------------------------------------------------------------ */
+
+  const STATE = {
+    START: 'start',
+    PLAYING: 'playing',
+    GAME_OVER: 'gameover',
+  };
+
+  let state = STATE.START;
+
+  let score = 0;
+  let elapsedTime = 0;      // seconds survived this run, drives difficulty
+  let spawnTimer = 0;       // ms until next spawn
+  let obstacles = [];
+  let roadLines = [];       // scrolling dashed lane-divider segments
+  let sideParticles = [];   // speed-streak particles on the shoulders
+  let shakeTime = 0;        // camera-shake countdown after a crash
+
+  /* ------------------------------------------------------------------ *
+   *  Player (bike)
+   * ------------------------------------------------------------------ */
+
+  const bike = {
+    laneIndex: 1,
+    x: laneCenters[1],
+    targetX: laneCenters[1],
+    y: HEIGHT - 120,
+    width: 34,
+    height: 62,
+    tilt: 0, // current visual lean, radians
+  };
+
+  function resetBike() {
+    bike.laneIndex = 1;
+    bike.x = laneCenters[1];
+    bike.targetX = laneCenters[1];
+    bike.tilt = 0;
+  }
+
+  function moveLeft() {
+    if (state !== STATE.PLAYING) return;
+    bike.laneIndex = Math.max(0, bike.laneIndex - 1);
+    bike.targetX = laneCenters[bike.laneIndex];
+  }
+
+  function moveRight() {
+    if (state !== STATE.PLAYING) return;
+    bike.laneIndex = Math.min(LANE_COUNT - 1, bike.laneIndex + 1);
+    bike.targetX = laneCenters[bike.laneIndex];
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Difficulty curve
+   *
+   *  Speed and spawn-rate both ramp up smoothly with survival time and
+   *  are clamped so the game stays winnable (just increasingly frantic).
+   * ------------------------------------------------------------------ */
+
+  function currentSpeed() {
+    return Math.min(230 + elapsedTime * 7, 620); // px / second
+  }
+
+  function currentSpawnInterval() {
+    return Math.max(1250 - elapsedTime * 16, 460); // ms
+  }
+
+  function currentDoubleSpawnChance() {
+    return Math.min(0.05 + elapsedTime * 0.004, 0.35);
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Obstacle (oncoming traffic) presets
+   *
+   *  A handful of vehicle "types" give the road some visual variety
+   *  without needing any image assets — everything is drawn with
+   *  simple canvas shapes.
+   * ------------------------------------------------------------------ */
+
+  const VEHICLE_PRESETS = [
+    { width: 46, height: 78, body: '#3d7fd6', window: '#0d1b2a', label: 'sedan',  value: 10 },
+    { width: 50, height: 70, body: '#4caf7d', window: '#0d1b16', label: 'coupe',  value: 12 },
+    { width: 48, height: 92, body: '#8a8f9a', window: '#15161a', label: 'truck',  value: 16 },
+    { width: 44, height: 76, body: '#d6a63d', window: '#231a05', label: 'taxi',   value: 10 },
+    { width: 46, height: 80, body: '#7a4cd6', window: '#160d2a', label: 'wagon',  value: 11 },
+  ];
+
+  function spawnObstacle(forceLane) {
+    const preset = VEHICLE_PRESETS[Math.floor(Math.random() * VEHICLE_PRESETS.length)];
+    const laneIndex = forceLane !== undefined
+      ? forceLane
+      : Math.floor(Math.random() * LANE_COUNT);
+
+    obstacles.push({
+      laneIndex,
+      x: laneCenters[laneIndex],
+      y: -preset.height,
+      width: preset.width,
+      height: preset.height,
+      body: preset.body,
+      window: preset.window,
+      value: preset.value,
+      passed: false,
+    });
+  }
+
+  function trySpawnWave() {
+    // Pick one lane for the primary obstacle.
+    const primaryLane = Math.floor(Math.random() * LANE_COUNT);
+    spawnObstacle(primaryLane);
+
+    // Occasionally add a second obstacle in a *different* lane so the
+    // road gets busier at higher difficulty — but never block every
+    // lane at once, so there's always a safe gap to dodge into.
+    if (Math.random() < currentDoubleSpawnChance()) {
+      let secondLane = Math.floor(Math.random() * LANE_COUNT);
+      if (secondLane === primaryLane) {
+        secondLane = (secondLane + 1) % LANE_COUNT;
+      }
+      spawnObstacle(secondLane);
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Road-line & particle setup (purely visual, for the "high speed"
+   *  feel)
+   * ------------------------------------------------------------------ */
+
+  const LANE_DASH_LENGTH = 34;
+  const LANE_GAP_LENGTH = 26;
+  const LANE_LINE_PERIOD = LANE_DASH_LENGTH + LANE_GAP_LENGTH;
+  let laneLineSpan = 0; // total looping distance for one divider's segments
+
+  function setupRoadLines() {
+    roadLines = [];
+
+    let segmentCount = 0;
+    for (let y = -LANE_LINE_PERIOD; y < HEIGHT + LANE_LINE_PERIOD; y += LANE_LINE_PERIOD) {
+      segmentCount++;
+    }
+    laneLineSpan = segmentCount * LANE_LINE_PERIOD;
+
+    for (let dividerIndex = 1; dividerIndex < LANE_COUNT; dividerIndex++) {
+      const x = ROAD_LEFT + LANE_WIDTH * dividerIndex;
+      for (let y = -LANE_LINE_PERIOD; y < HEIGHT + LANE_LINE_PERIOD; y += LANE_LINE_PERIOD) {
+        roadLines.push({ x, y, dash: LANE_DASH_LENGTH });
+      }
+    }
+  }
+
+  function setupSideParticles() {
+    sideParticles = [];
+    for (let i = 0; i < 24; i++) {
+      sideParticles.push(makeSideParticle(Math.random() * HEIGHT));
+    }
+  }
+
+  function makeSideParticle(y) {
+    const onLeft = Math.random() < 0.5;
+    const margin = onLeft
+      ? Math.random() * (ROAD_LEFT - 8)
+      : ROAD_RIGHT + 8 + Math.random() * (WIDTH - ROAD_RIGHT - 8);
+    return {
+      x: margin,
+      y,
+      length: 10 + Math.random() * 18,
+      alpha: 0.15 + Math.random() * 0.35,
+    };
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Input handling
+   * ------------------------------------------------------------------ */
+
+  window.addEventListener('keydown', (e) => {
+    if (e.repeat) return; // ignore OS key-repeat; one press = one lane change
+
+    switch (e.code) {
+      case 'ArrowLeft':
+      case 'KeyA':
+        moveLeft();
+        break;
+      case 'ArrowRight':
+      case 'KeyD':
+        moveRight();
+        break;
+      case 'Space':
+      case 'Enter':
+        e.preventDefault();
+        if (state === STATE.START) {
+          startGame();
+        } else if (state === STATE.GAME_OVER) {
+          startGame();
+        }
+        break;
+      default:
+        break;
+    }
+  });
+
+  // Touch / mouse controls (also works fine with a plain click).
+  btnLeft.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    moveLeft();
+  });
+  btnRight.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    moveRight();
+  });
+
+  startButton.addEventListener('click', (e) => {
+    e.stopPropagation();
+    startGame();
+  });
+  restartButton.addEventListener('click', (e) => {
+    e.stopPropagation();
+    startGame();
+  });
+  // Clicking anywhere on either overlay also begins/restarts the game.
+  startScreen.addEventListener('click', startGame);
+  gameOverScreen.addEventListener('click', startGame);
+
+  /* ------------------------------------------------------------------ *
+   *  Game state transitions
+   * ------------------------------------------------------------------ */
+
+  function startGame() {
+    state = STATE.PLAYING;
+    score = 0;
+    elapsedTime = 0;
+    spawnTimer = 0;
+    shakeTime = 0;
+    obstacles = [];
+
+    resetBike();
+    setupRoadLines();
+    setupSideParticles();
+
+    startScreen.classList.add('hidden');
+    gameOverScreen.classList.add('hidden');
+
+    updateHud();
+  }
+
+  function endGame() {
+    state = STATE.GAME_OVER;
+    shakeTime = 0.35;
+
+    const finalScore = Math.floor(score);
+    if (finalScore > highScore) {
+      highScore = finalScore;
+      saveHighScore(highScore);
+    }
+
+    finalScoreEl.textContent = finalScore;
+    finalBestEl.textContent = highScore;
+    gameOverScreen.classList.remove('hidden');
+    updateHud();
+  }
+
+  function updateHud() {
+    scoreValueEl.textContent = Math.floor(score);
+    bestValueEl.textContent = highScore;
+    speedValueEl.textContent = Math.round(currentSpeed());
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Collision detection (simple, slightly-forgiving AABB overlap)
+   * ------------------------------------------------------------------ */
+
+  function rectsOverlap(a, b) {
+    return (
+      a.left < b.right &&
+      a.right > b.left &&
+      a.top < b.bottom &&
+      a.bottom > b.top
+    );
+  }
+
+  function checkCollisions() {
+    const inset = 6; // shrink hitboxes slightly so near-misses feel fair
+    const bikeBox = {
+      left: bike.x - bike.width / 2 + inset,
+      right: bike.x + bike.width / 2 - inset,
+      top: bike.y - bike.height / 2 + inset,
+      bottom: bike.y + bike.height / 2 - inset,
+    };
+
+    for (const obstacle of obstacles) {
+      const obstacleBox = {
+        left: obstacle.x - obstacle.width / 2 + inset,
+        right: obstacle.x + obstacle.width / 2 - inset,
+        top: obstacle.y - obstacle.height / 2 + inset,
+        bottom: obstacle.y + obstacle.height / 2 - inset,
+      };
+      if (rectsOverlap(bikeBox, obstacleBox)) {
+        endGame();
+        return;
+      }
+    }
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Update loop
+   * ------------------------------------------------------------------ */
+
+  function update(dt) {
+    if (state !== STATE.PLAYING) return;
+
+    elapsedTime += dt;
+    const speed = currentSpeed();
+
+    // Smoothly ease the bike toward its target lane (gives a nice,
+    // weighty steering feel instead of a hard snap).
+    const easing = Math.min(1, dt * 10);
+    bike.x += (bike.targetX - bike.x) * easing;
+    bike.tilt = (bike.targetX - bike.x) * 0.02;
+
+    // Spawn new oncoming traffic on a timer.
+    spawnTimer -= dt * 1000;
+    if (spawnTimer <= 0) {
+      trySpawnWave();
+      spawnTimer = currentSpawnInterval();
+    }
+
+    // Move obstacles down the road; score points for anything dodged.
+    for (const obstacle of obstacles) {
+      obstacle.y += speed * dt;
+      if (!obstacle.passed && obstacle.y - obstacle.height / 2 > bike.y + bike.height / 2) {
+        obstacle.passed = true;
+        score += obstacle.value;
+      }
+    }
+    obstacles = obstacles.filter((o) => o.y - o.height / 2 < HEIGHT + 40);
+
+    // Continuous distance score, so standing still (in traffic terms)
+    // still rewards survival time.
+    score += speed * dt * 0.02;
+
+    // Scroll the dashed lane dividers.
+    for (const line of roadLines) {
+      line.y += speed * dt;
+      if (line.y > HEIGHT + line.dash) {
+        line.y -= laneLineSpan;
+      }
+    }
+
+    // Scroll the roadside speed-streak particles (they move faster than
+    // traffic to sell the sense of speed).
+    for (let i = 0; i < sideParticles.length; i++) {
+      const p = sideParticles[i];
+      p.y += speed * dt * 1.6;
+      if (p.y > HEIGHT + p.length) {
+        sideParticles[i] = makeSideParticle(-p.length);
+      }
+    }
+
+    if (shakeTime > 0) shakeTime = Math.max(0, shakeTime - dt);
+
+    checkCollisions();
+    updateHud();
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Rendering
+   * ------------------------------------------------------------------ */
+
+  function drawBackground() {
+    // Off-road shoulders
+    ctx.fillStyle = '#111219';
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+    // Road surface
+    ctx.fillStyle = '#26282f';
+    ctx.fillRect(ROAD_LEFT, 0, ROAD_WIDTH, HEIGHT);
+
+    // Curb stripes along the road edges
+    ctx.fillStyle = '#e8e8e8';
+    ctx.fillRect(ROAD_LEFT - 5, 0, 5, HEIGHT);
+    ctx.fillRect(ROAD_RIGHT, 0, 5, HEIGHT);
+
+    // Dashed lane dividers
+    ctx.strokeStyle = '#f4c430';
+    ctx.lineWidth = 4;
+    ctx.lineCap = 'round';
+    for (const line of roadLines) {
+      ctx.beginPath();
+      ctx.moveTo(line.x, line.y);
+      ctx.lineTo(line.x, line.y + line.dash);
+      ctx.stroke();
+    }
+
+    // Roadside speed-streak particles
+    for (const p of sideParticles) {
+      ctx.strokeStyle = `rgba(255, 92, 104, ${p.alpha})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(p.x, p.y);
+      ctx.lineTo(p.x, p.y + p.length);
+      ctx.stroke();
+    }
+  }
+
+  function drawVehicle(v) {
+    ctx.save();
+    ctx.translate(v.x, v.y);
+
+    const w = v.width;
+    const h = v.height;
+    const r = 8;
+
+    // Soft shadow under the vehicle
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.35)';
+    roundedRect(-w / 2, -h / 2 + 6, w, h, r);
+    ctx.fill();
+
+    // Body
+    ctx.fillStyle = v.body;
+    roundedRect(-w / 2, -h / 2, w, h, r);
+    ctx.fill();
+
+    // Windshield (toward the top / front of the vehicle)
+    ctx.fillStyle = v.window;
+    roundedRect(-w / 2 + 6, -h / 2 + 8, w - 12, h * 0.28, 4);
+    ctx.fill();
+
+    // Rear window
+    roundedRect(-w / 2 + 6, h / 2 - h * 0.28 - 8, w - 12, h * 0.22, 4);
+    ctx.fill();
+
+    // Headlights (front, facing the player who is below)
+    ctx.fillStyle = '#fff6c8';
+    ctx.beginPath();
+    ctx.arc(-w / 2 + 7, h / 2 - 6, 3.2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(w / 2 - 7, h / 2 - 6, 3.2, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Taillights (rear, facing away from the player)
+    ctx.fillStyle = '#ff4d4d';
+    ctx.beginPath();
+    ctx.arc(-w / 2 + 7, -h / 2 + 6, 2.6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(w / 2 - 7, -h / 2 + 6, 2.6, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  function drawBike() {
+    ctx.save();
+    ctx.translate(bike.x, bike.y);
+    ctx.rotate(bike.tilt);
+
+    // Ground shadow
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.4)';
+    ctx.beginPath();
+    ctx.ellipse(0, bike.height / 2 + 4, bike.width / 2 + 2, 7, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Rear wheel & front wheel
+    ctx.fillStyle = '#111';
+    ctx.beginPath();
+    ctx.arc(0, bike.height / 2 - 6, 8, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(0, -bike.height / 2 + 6, 8, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Wheel hubs
+    ctx.fillStyle = '#c9ced6';
+    ctx.beginPath();
+    ctx.arc(0, bike.height / 2 - 6, 3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(0, -bike.height / 2 + 6, 3, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Main body (retro tank + tail silhouette) — a simple red hexagon
+    ctx.fillStyle = '#e63946';
+    ctx.beginPath();
+    ctx.moveTo(-7, bike.height / 2 - 8);
+    ctx.lineTo(-9, 4);
+    ctx.lineTo(-6, -bike.height / 2 + 14);
+    ctx.lineTo(0, -bike.height / 2 + 6);
+    ctx.lineTo(6, -bike.height / 2 + 14);
+    ctx.lineTo(9, 4);
+    ctx.lineTo(7, bike.height / 2 - 8);
+    ctx.closePath();
+    ctx.fill();
+
+    // Black racing stripe down the middle
+    ctx.fillStyle = '#15161a';
+    ctx.fillRect(-2.5, -bike.height / 2 + 10, 5, bike.height - 24);
+
+    // Fuel tank highlight
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.18)';
+    ctx.beginPath();
+    ctx.ellipse(-3, -bike.height / 4, 3, 8, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Rider silhouette
+    ctx.fillStyle = '#0d0e12';
+    ctx.beginPath();
+    ctx.ellipse(0, -4, 6, 10, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath(); // helmet
+    ctx.arc(0, -bike.height / 4 - 2, 5.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#3d7fd6';
+    ctx.beginPath(); // visor
+    ctx.arc(0, -bike.height / 4 - 3, 3, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Headlight glow (front of the bike)
+    ctx.fillStyle = '#fff6c8';
+    ctx.beginPath();
+    ctx.arc(0, -bike.height / 2 + 2, 3, 0, Math.PI * 2);
+    ctx.fill();
+    const glow = ctx.createRadialGradient(0, -bike.height / 2 + 2, 0, 0, -bike.height / 2 + 2, 16);
+    glow.addColorStop(0, 'rgba(255, 246, 200, 0.5)');
+    glow.addColorStop(1, 'rgba(255, 246, 200, 0)');
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.arc(0, -bike.height / 2 + 2, 16, 0, Math.PI * 2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+
+  function roundedRect(x, y, w, h, r) {
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
+  }
+
+  function render() {
+    ctx.save();
+
+    // Small camera shake right after a crash, for impact.
+    if (shakeTime > 0) {
+      const intensity = shakeTime * 18;
+      ctx.translate(
+        (Math.random() - 0.5) * intensity,
+        (Math.random() - 0.5) * intensity
+      );
+    }
+
+    drawBackground();
+
+    for (const obstacle of obstacles) {
+      drawVehicle(obstacle);
+    }
+
+    if (state !== STATE.START) {
+      drawBike();
+    }
+
+    ctx.restore();
+
+    // Subtle vignette for atmosphere
+    const vignette = ctx.createRadialGradient(
+      WIDTH / 2, HEIGHT / 2, HEIGHT * 0.3,
+      WIDTH / 2, HEIGHT / 2, HEIGHT * 0.75
+    );
+    vignette.addColorStop(0, 'rgba(0,0,0,0)');
+    vignette.addColorStop(1, 'rgba(0,0,0,0.45)');
+    ctx.fillStyle = vignette;
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+  }
+
+  /* ------------------------------------------------------------------ *
+   *  Main loop
+   * ------------------------------------------------------------------ */
+
+  let lastTime = performance.now();
+
+  function loop(now) {
+    let dt = (now - lastTime) / 1000;
+    lastTime = now;
+
+    // Clamp dt so a tab going inactive for a while doesn't cause the
+    // bike/obstacles to "jump" forward when the tab regains focus.
+    dt = Math.min(dt, 1 / 20);
+
+    update(dt);
+    render();
+
+    requestAnimationFrame(loop);
+  }
+
+  // Initial static frame so the start screen has some road behind it.
+  setupRoadLines();
+  setupSideParticles();
+  updateHud();
+  render();
+
+  requestAnimationFrame(loop);
+})();
